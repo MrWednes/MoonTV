@@ -4,7 +4,7 @@
 
 import Artplayer from 'artplayer';
 import Hls from 'hls.js';
-import { Heart } from 'lucide-react';
+import { CheckCircle2, Download, Heart } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useRef, useState } from 'react';
 
@@ -23,6 +23,13 @@ import {
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
 import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
+import {
+  createOfflineUrl,
+  downloadOfflineEpisode,
+  getOfflineItems,
+  isOfflineCacheReady,
+  makeOfflineCacheKey,
+} from '@/lib/offlineCache.client';
 
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
@@ -111,7 +118,12 @@ function PlayPageClient() {
     needPreferRef.current = needPrefer;
   }, [needPrefer]);
   // 集数相关
-  const [currentEpisodeIndex, setCurrentEpisodeIndex] = useState(0);
+  const requestedEpisode = Number(searchParams.get('episode'));
+  const [currentEpisodeIndex, setCurrentEpisodeIndex] = useState(
+    Number.isInteger(requestedEpisode) && requestedEpisode >= 0
+      ? requestedEpisode
+      : 0
+  );
 
   const currentSourceRef = useRef(currentSource);
   const currentIdRef = useRef(currentId);
@@ -139,6 +151,11 @@ function PlayPageClient() {
 
   // 视频播放地址
   const [videoUrl, setVideoUrl] = useState('');
+  const [offlineCacheState, setOfflineCacheState] = useState<
+    'unknown' | 'ready' | 'downloading' | 'error'
+  >('unknown');
+  const [offlineCacheProgress, setOfflineCacheProgress] = useState(0);
+  const offlinePlaybackRef = useRef<{ revoke: () => void } | null>(null);
 
   // 总集数
   const totalEpisodes = detail?.episodes?.length || 0;
@@ -588,10 +605,65 @@ function PlayPageClient() {
     }
   }
 
-  // 当集数索引变化时自动更新视频地址
+  // 当集数索引变化时自动更新视频地址。
+  // 如果本集已经缓存，则优先使用 IndexedDB 中的本地 HLS。
   useEffect(() => {
-    updateVideoUrl(detail, currentEpisodeIndex);
-  }, [detail, currentEpisodeIndex]);
+    let cancelled = false;
+
+    const loadEpisodeUrl = async () => {
+      const remoteUrl = detail?.episodes?.[currentEpisodeIndex] || '';
+
+      if (offlinePlaybackRef.current) {
+        offlinePlaybackRef.current.revoke();
+        offlinePlaybackRef.current = null;
+      }
+
+      if (!remoteUrl || !currentSource || !currentId) {
+        setVideoUrl(remoteUrl);
+        setOfflineCacheState('unknown');
+        return;
+      }
+
+      const key = makeOfflineCacheKey(
+        currentSource,
+        currentId,
+        currentEpisodeIndex
+      );
+
+      try {
+        const ready = await isOfflineCacheReady(key);
+        if (!ready) {
+          if (!cancelled) {
+            setOfflineCacheState('unknown');
+            setVideoUrl(remoteUrl);
+          }
+          return;
+        }
+
+        const local = await createOfflineUrl(key);
+        if (!cancelled && local) {
+          offlinePlaybackRef.current = local;
+          setOfflineCacheState('ready');
+          setVideoUrl(local.url);
+        } else if (!cancelled) {
+          setVideoUrl(remoteUrl);
+          setOfflineCacheState('unknown');
+        }
+      } catch (err) {
+        console.warn('读取离线缓存失败，回退在线播放:', err);
+        if (!cancelled) {
+          setVideoUrl(remoteUrl);
+          setOfflineCacheState('unknown');
+        }
+      }
+    };
+
+    void loadEpisodeUrl();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [detail, currentEpisodeIndex, currentSource, currentId]);
 
   // 进入页面时直接获取全部源信息
   useEffect(() => {
@@ -665,7 +737,54 @@ function PlayPageClient() {
           : '🔍 正在搜索播放源...'
       );
 
-      let sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
+      let sourcesInfo: SearchResult[] = [];
+
+      // 从“离线缓存”入口进入时，即使完全没有网络，也可以直接恢复已缓存剧集。
+      if (searchParams.get('offline') === 'true' && currentSource && currentId) {
+        try {
+          const cachedItems = (await getOfflineItems()).filter(
+            (item) =>
+              item.source === currentSource &&
+              item.contentId === currentId &&
+              item.status === 'ready'
+          );
+
+          if (cachedItems.length > 0) {
+            const maxEpisode = Math.max(
+              ...cachedItems.map((item) => item.episodeIndex)
+            );
+            const episodes = Array.from(
+              { length: maxEpisode + 1 },
+              (_, index) =>
+                cachedItems.find((item) => item.episodeIndex === index)
+                  ?.episodeUrl || ''
+            );
+
+            const cachedDetail = {
+              source: currentSource,
+              source_name: cachedItems[0].source,
+              id: currentId,
+              title: cachedItems[0].title,
+              year: '',
+              poster: cachedItems[0].cover || '',
+              type_name: '',
+              class: '',
+              desc: '离线缓存内容',
+              episodes,
+            } as SearchResult;
+
+            sourcesInfo = [cachedDetail];
+            setAvailableSources([cachedDetail]);
+          }
+        } catch (err) {
+          console.warn('读取离线详情失败:', err);
+        }
+      }
+
+      if (sourcesInfo.length === 0) {
+        sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
+      }
+
       if (
         currentSource &&
         currentId &&
@@ -745,6 +864,7 @@ function PlayPageClient() {
   useEffect(() => {
     // 仅在初次挂载时检查播放记录
     const initFromHistory = async () => {
+      if (searchParams.get('episode') !== null) return;
       if (!currentSource || !currentId) return;
 
       try {
@@ -790,6 +910,97 @@ function PlayPageClient() {
 
     initSkipConfig();
   }, []);
+
+  const handleDownloadCurrentEpisode = async () => {
+    const d = detailRef.current;
+    const source = currentSourceRef.current;
+    const id = currentIdRef.current;
+    const index = currentEpisodeIndexRef.current;
+    const episodeUrl = d?.episodes?.[index];
+
+    if (!d || !source || !id || !episodeUrl) return;
+
+    const key = makeOfflineCacheKey(source, id, index);
+    setOfflineCacheState('downloading');
+    setOfflineCacheProgress(0);
+
+    try {
+      await downloadOfflineEpisode({
+        key,
+        title: videoTitleRef.current || d.title || '未命名视频',
+        episodeIndex: index,
+        source,
+        contentId: id,
+        episodeUrl,
+        cover: videoCover,
+        onProgress: (item) => {
+          setOfflineCacheProgress(item.progress);
+          setOfflineCacheState(
+            item.status === 'ready'
+              ? 'ready'
+              : item.status === 'error'
+                ? 'error'
+                : 'downloading'
+          );
+        },
+      });
+
+      setOfflineCacheState('ready');
+    } catch (err) {
+      console.error('离线缓存失败:', err);
+      setOfflineCacheState('error');
+      window.alert(
+        `缓存失败：${err instanceof Error ? err.message : '未知错误'}`
+      );
+    }
+  };
+
+  const handleDownloadAllEpisodes = async () => {
+    const d = detailRef.current;
+    const source = currentSourceRef.current;
+    const id = currentIdRef.current;
+
+    if (!d?.episodes?.length || !source || !id) return;
+
+    setOfflineCacheState('downloading');
+    setOfflineCacheProgress(0);
+
+    try {
+      for (let index = 0; index < d.episodes.length; index++) {
+        const episodeUrl = d.episodes[index];
+        if (!episodeUrl) continue;
+
+        const key = makeOfflineCacheKey(source, id, index);
+        await downloadOfflineEpisode({
+          key,
+          title: videoTitleRef.current || d.title || '未命名视频',
+          episodeIndex: index,
+          source,
+          contentId: id,
+          episodeUrl,
+          cover: videoCover,
+          onProgress: (item) => {
+            const overall =
+              ((index + item.progress / 100) / d.episodes.length) * 100;
+            setOfflineCacheProgress(Math.round(overall));
+            setOfflineCacheState(
+              item.status === 'error' ? 'error' : 'downloading'
+            );
+          },
+        });
+      }
+
+      setOfflineCacheProgress(100);
+      setOfflineCacheState('ready');
+      window.alert('全部集数已缓存完成');
+    } catch (err) {
+      console.error('批量离线缓存失败:', err);
+      setOfflineCacheState('error');
+      window.alert(
+        `批量缓存失败：${err instanceof Error ? err.message : '未知错误'}`
+      );
+    }
+  };
 
   // 处理换源
   const handleSourceChange = async (
@@ -1753,6 +1964,43 @@ function PlayPageClient() {
               </span>
             )}
           </h1>
+          <div className='mt-2 flex flex-wrap items-center gap-2'>
+            <button
+              onClick={() => void handleDownloadCurrentEpisode()}
+              disabled={
+                offlineCacheState === 'downloading' ||
+                !detail?.episodes?.[currentEpisodeIndex]
+              }
+              className='inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'
+              title='将当前集下载到本机，断网后也可以播放'
+            >
+              {offlineCacheState === 'ready' ? (
+                <CheckCircle2 className='h-4 w-4 text-green-500' />
+              ) : (
+                <Download className='h-4 w-4' />
+              )}
+              {offlineCacheState === 'downloading'
+                ? `缓存中 ${offlineCacheProgress}%`
+                : offlineCacheState === 'ready'
+                  ? '已缓存'
+                  : '缓存当前集'}
+            </button>
+            {totalEpisodes > 1 && (
+              <button
+                onClick={() => void handleDownloadAllEpisodes()}
+                disabled={offlineCacheState === 'downloading'}
+                className='rounded-lg px-2 py-1.5 text-sm text-green-600 hover:bg-green-50 disabled:opacity-50 dark:text-green-400 dark:hover:bg-green-950/30'
+              >
+                缓存全部 {offlineCacheState === 'downloading' ? `(${offlineCacheProgress}%)` : ''}
+              </button>
+            )}
+            <a
+              href='/cache'
+              className='text-sm text-green-600 hover:underline dark:text-green-400'
+            >
+              管理离线缓存
+            </a>
+          </div>
         </div>
         {/* 第二行：播放器和选集 */}
         <div className='space-y-2'>
